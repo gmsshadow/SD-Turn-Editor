@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Runtime data (local)
+data/
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+
