@@ -23,9 +23,11 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QStackedWidget,
     QStatusBar,
+    QTextEdit,
     QToolBar,
     QVBoxLayout,
     QWidget,
+    QSplitter,
 )
 
 from sd_order_gui.core import db
@@ -54,7 +56,17 @@ class MainWindow(QMainWindow):
 
         self._list = QListWidget()
         self._list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
-        self.setCentralWidget(self._list)
+
+        self._report = QTextEdit()
+        self._report.setReadOnly(True)
+        self._report.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+
+        splitter = QSplitter()
+        splitter.addWidget(self._list)
+        splitter.addWidget(self._report)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
+        self.setCentralWidget(splitter)
 
         self.setStatusBar(QStatusBar())
 
@@ -70,6 +82,8 @@ class MainWindow(QMainWindow):
 
         compose_action = tb.addAction("Compose orders…")
         compose_action.triggered.connect(self.compose_orders)  # type: ignore[arg-type]
+
+        self._list.currentRowChanged.connect(self._on_entity_selected)  # type: ignore[arg-type]
 
         self.refresh_entities()
 
@@ -93,6 +107,9 @@ class MainWindow(QMainWindow):
                 f"{r['entity_type'].upper():8} {r['name']} ({r['entity_id']})  — last seen {r['last_seen_turn']}"
             )
 
+        if self._list.count() > 0 and self._list.currentRow() < 0:
+            self._list.setCurrentRow(0)
+
     def _get_selected_entity(self) -> dict | None:
         row = self._list.currentRow()
         if row < 0:
@@ -111,6 +128,47 @@ class MainWindow(QMainWindow):
         finally:
             conn.close()
         return dict(rows[0]) if rows else None
+
+    def _on_entity_selected(self) -> None:
+        ent = self._get_selected_entity()
+        if not ent:
+            self._report.setPlainText("")
+            return
+
+        # Load the most recently-seen report for this entity.
+        conn = db.connect(self._paths.db_path)
+        try:
+            row = conn.execute(
+                """
+                SELECT last_seen_report_path, last_seen_turn, account_number
+                FROM entities
+                WHERE entity_type = ? AND entity_id = ?
+                """,
+                (str(ent["entity_type"]), str(ent["entity_id"])),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        if not row:
+            self._report.setPlainText("")
+            return
+
+        report_path = Path(str(row["last_seen_report_path"]))
+        if not report_path.exists():
+            self._report.setPlainText(
+                f"Report not found on disk:\n{report_path}\n\n"
+                "This can happen if the file was moved/deleted after import."
+            )
+            return
+
+        text = report_path.read_text(encoding="utf-8", errors="replace")
+        header = (
+            f"{str(ent['entity_type']).upper()} {ent['name']} ({ent['entity_id']})\n"
+            f"Last seen turn: {row['last_seen_turn']}\n"
+            f"Report: {report_path}\n"
+            "\n"
+        )
+        self._report.setPlainText(header + text)
 
     def import_turns(self) -> None:
         files, _ = QFileDialog.getOpenFileNames(
