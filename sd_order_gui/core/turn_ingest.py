@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Iterable
 
 from sd_order_gui.core.db import init_db
+from sd_order_gui.core.turn_parse import parse_entities_from_report_text
 
 
 TURN_NUMBER_RE = r"Star Date\s+(?P<turn>\d+\.\d+)"
@@ -87,6 +88,29 @@ def ingest_turn_files(
                 """,
                 (str(turn_number), str(f), str(stored), now),
             )
+
+            # Parse + upsert any entities found in this report.
+            _, entities = parse_entities_from_report_text(text)
+            for e in entities:
+                conn.execute(
+                    """
+                    INSERT INTO entities(entity_type, entity_id, name, account_number, last_seen_turn, last_seen_report_path)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(entity_type, entity_id) DO UPDATE SET
+                      name = excluded.name,
+                      account_number = COALESCE(excluded.account_number, entities.account_number),
+                      last_seen_turn = excluded.last_seen_turn,
+                      last_seen_report_path = excluded.last_seen_report_path
+                    """,
+                    (
+                        e.entity_type,
+                        e.entity_id,
+                        e.name,
+                        e.account_number,
+                        str(turn_number),
+                        str(stored),
+                    ),
+                )
             conn.commit()
 
             results.append(

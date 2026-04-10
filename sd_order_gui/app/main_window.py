@@ -41,6 +41,31 @@ class MainWindow(QMainWindow):
         import_action = tb.addAction("Import turns…")
         import_action.triggered.connect(self.import_turns)  # type: ignore[arg-type]
 
+        refresh_action = tb.addAction("Refresh entities")
+        refresh_action.triggered.connect(self.refresh_entities)  # type: ignore[arg-type]
+
+        self.refresh_entities()
+
+    def refresh_entities(self) -> None:
+        self._list.clear()
+        conn = db.connect(self._paths.db_path)
+        try:
+            db.init_db(conn)
+            rows = conn.execute(
+                """
+                SELECT entity_type, entity_id, name, last_seen_turn
+                FROM entities
+                ORDER BY entity_type, name
+                """
+            ).fetchall()
+        finally:
+            conn.close()
+
+        for r in rows:
+            self._list.addItem(
+                f"{r['entity_type'].upper():8} {r['name']} ({r['entity_id']})  — last seen {r['last_seen_turn']}"
+            )
+
     def import_turns(self) -> None:
         files, _ = QFileDialog.getOpenFileNames(
             self,
@@ -85,6 +110,8 @@ class MainWindow(QMainWindow):
                 "Some files failed to import",
                 f"{len(bad)} file(s) could not be imported:\n\n{msg}",
             )
+
+        self.refresh_entities()
 
 
 def run_app() -> None:

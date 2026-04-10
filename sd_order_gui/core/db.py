@@ -17,6 +17,19 @@ CREATE TABLE IF NOT EXISTS imported_turn_files (
 
 CREATE INDEX IF NOT EXISTS idx_imported_turn_files_turn
   ON imported_turn_files(turn_number);
+
+CREATE TABLE IF NOT EXISTS entities (
+  entity_type TEXT NOT NULL,               -- ship | prefect | starbase | port | outpost
+  entity_id TEXT NOT NULL,                 -- numeric, but stored as text for safety
+  name TEXT NOT NULL,
+  account_number TEXT,                     -- secret; may be null if unknown
+  last_seen_turn TEXT NOT NULL,
+  last_seen_report_path TEXT NOT NULL,
+  PRIMARY KEY (entity_type, entity_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_entities_type_name
+  ON entities(entity_type, name);
 """
 
 
