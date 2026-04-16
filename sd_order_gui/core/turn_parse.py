@@ -22,6 +22,16 @@ ENTITY_HEADER_RE = re.compile(
     r"(?P<name>.+?)\s*\((?P<id>\d+)\)\s*$"
 )
 
+# Base reports use a different title format, e.g.
+#   "STA STARBASE: Citadel Station (45687590)"
+#   "SURFACE PORT: New Corinth (12340001)"
+BASE_TITLE_RE = re.compile(
+    r"^\s*(?:(?P<faction>[A-Z]{2,5})\s+)?"
+    r"(?P<kind>STARBASE|SURFACE\s+PORT|OUTPOST)\s*:\s*"
+    r"(?P<name>.+?)\s*\((?P<id>\d+)\)\s*$",
+    re.IGNORECASE,
+)
+
 ACCOUNT_RE = re.compile(r"^\s*Account:\s*(?P<acct>\d+)\s*$")
 
 
@@ -41,6 +51,21 @@ def parse_entities_from_report_text(text: str) -> tuple[str | None, list[ParsedE
     # so we attach the next seen account number to the most recent entity.
     for raw_line in text.splitlines():
         line = raw_line.rstrip("\n")
+
+        bm = BASE_TITLE_RE.match(line)
+        if bm:
+            kind_raw = bm.group("kind").lower().replace(" ", "_")
+            entity_type = {"surface_port": "port"}.get(kind_raw, kind_raw)
+            entities.append(
+                ParsedEntity(
+                    entity_type=entity_type,
+                    entity_id=bm.group("id"),
+                    name=bm.group("name").strip(),
+                    account_number=None,
+                )
+            )
+            pending_entity_idx = len(entities) - 1
+            continue
 
         m = ENTITY_HEADER_RE.match(line)
         if m:

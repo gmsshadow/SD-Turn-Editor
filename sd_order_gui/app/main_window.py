@@ -224,17 +224,9 @@ class MainWindow(QMainWindow):
 
     def compose_orders(self) -> None:
         ent = self._get_selected_entity()
-        if not ent:
-            QMessageBox.information(self, "Select an entity", "Select a ship/prefect/base first.")
-            return
-
         dlg = ComposeOrdersDialog(
             parent=self,
-            entity_type=str(ent["entity_type"]),
-            entity_id=str(ent["entity_id"]),
-            entity_name=str(ent["name"]),
-            account_number=str(ent["account_number"] or ""),
-            turn_number=str(ent["last_seen_turn"]),
+            initial_entity=ent,
             settings=self._settings,
         )
         dlg.exec()
@@ -303,8 +295,10 @@ class AddOrderDialog(QDialog):
             return self._catalog.allowed_for_subject(subject_type=subject_type)
         if subject_type in ("starbase", "port", "outpost"):
             # Stellar Dominion treats base subjects separately; for now expose only
-            # the explicitly base-oriented commands.
-            base_cmds = {"BUILD", "SETBUY", "SETSELL", "RENAMEBASE"}
+            # the explicitly base-oriented commands + base combat lists.
+            base_cmds = {"BUILD", "SETBUY", "SETSELL", "TARGET", "DEFEND"}
+            if subject_type == "starbase":
+                base_cmds.add("RENAMEBASE")
             return sorted(
                 [c for c in self._catalog.commands.values() if c.command in base_cmds],
                 key=lambda s: s.command,
@@ -699,24 +693,22 @@ class ComposeOrdersDialog(QDialog):
         self,
         *,
         parent,
-        entity_type: str,
-        entity_id: str,
-        entity_name: str,
-        account_number: str,
-        turn_number: str,
+        initial_entity: dict | None,
         settings,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Compose Orders")
         self.resize(900, 600)
 
-        self._entity_type = entity_type
-        self._entity_id = entity_id
-        self._entity_name = entity_name
-        self._turn_number = turn_number
         self._settings = settings
 
-        self._account = QLineEdit(account_number)
+        self._entity_combo = QComboBox()
+        self._entity_combo.currentIndexChanged.connect(self._on_entity_combo_changed)  # type: ignore[arg-type]
+
+        self._entity_summary = QLineEdit()
+        self._entity_summary.setReadOnly(True)
+
+        self._account = QLineEdit("")
         self._account.setPlaceholderText("Account number (secret)")
 
         self._orders = QListWidget()
@@ -731,7 +723,8 @@ class ComposeOrdersDialog(QDialog):
         save_btn.clicked.connect(self._save_yaml)  # type: ignore[arg-type]
 
         top_form = QFormLayout()
-        top_form.addRow("Entity", QLineEdit(f"{entity_type} {entity_name} ({entity_id})"))
+        top_form.addRow("Subject", self._entity_combo)
+        top_form.addRow("Selected", self._entity_summary)
         top_form.addRow("Account", self._account)
 
         btn_row = QHBoxLayout()
@@ -746,6 +739,8 @@ class ComposeOrdersDialog(QDialog):
         layout.addLayout(btn_row)
         self.setLayout(layout)
 
+        self._load_entities(initial_entity=initial_entity)
+
     def _display_for_order(self, order: DraftOrder) -> str:
         if order.raw_params is None:
             return order.command
@@ -755,7 +750,11 @@ class ComposeOrdersDialog(QDialog):
         return f"{order.command}: {order.raw_params}"
 
     def _add_order(self) -> None:
-        dlg = AddOrderDialog(parent=self, subject_type=self._entity_type, settings=self._settings)
+        ent = self._current_entity()
+        if not ent:
+            QMessageBox.warning(self, "No subject selected", "Select a subject first.")
+            return
+        dlg = AddOrderDialog(parent=self, subject_type=str(ent["entity_type"]), settings=self._settings)
         order = dlg.get_order()
         if not order:
             return
@@ -769,6 +768,11 @@ class ComposeOrdersDialog(QDialog):
             self._orders.takeItem(row)
 
     def _save_yaml(self) -> None:
+        ent = self._current_entity()
+        if not ent:
+            QMessageBox.warning(self, "No subject selected", "Select a subject first.")
+            return
+
         account = self._account.text().strip()
         if not account.isdigit():
             QMessageBox.warning(self, "Account required", "Enter a numeric account number.")
@@ -780,8 +784,8 @@ class ComposeOrdersDialog(QDialog):
         draft = DraftOrderFile(
             game=self._settings.game_id,
             account=account,
-            subject_type=self._entity_type,
-            subject_id=self._entity_id,
+            subject_type=str(ent["entity_type"]),
+            subject_id=str(ent["entity_id"]),
             orders=[],
         )
 
@@ -805,9 +809,9 @@ class ComposeOrdersDialog(QDialog):
         content = build_orders_yaml(draft, parsed_orders=parsed_orders)
 
         default_name = default_output_filename(
-            entity_name=self._entity_name,
-            entity_id=self._entity_id,
-            turn_number=self._turn_number,
+            entity_name=str(ent["name"]),
+            entity_id=str(ent["entity_id"]),
+            turn_number=str(ent["last_seen_turn"]),
         )
         output_dir = Path(get_paths().project_root) / self._settings.output_dir
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -823,6 +827,60 @@ class ComposeOrdersDialog(QDialog):
 
         write_orders_file(Path(path_str), content)
         QMessageBox.information(self, "Saved", f"Saved orders to:\n{path_str}")
+
+    def _load_entities(self, *, initial_entity: dict | None) -> None:
+        self._entity_combo.clear()
+        paths = get_paths()
+        conn = db.connect(paths.db_path)
+        try:
+            db.init_db(conn)
+            rows = conn.execute(
+                """
+                SELECT entity_type, entity_id, name, account_number, last_seen_turn
+                FROM entities
+                ORDER BY entity_type, name
+                """
+            ).fetchall()
+        finally:
+            conn.close()
+
+        initial_key = None
+        if initial_entity:
+            initial_key = (str(initial_entity.get("entity_type")), str(initial_entity.get("entity_id")))
+
+        initial_index = 0
+        for idx, r in enumerate(rows):
+            label = f"{r['entity_type'].upper():8} {r['name']} ({r['entity_id']}) — {r['last_seen_turn']}"
+            payload = {
+                "entity_type": r["entity_type"],
+                "entity_id": r["entity_id"],
+                "name": r["name"],
+                "account_number": r["account_number"],
+                "last_seen_turn": r["last_seen_turn"],
+            }
+            self._entity_combo.addItem(label, payload)
+            if initial_key and (str(r["entity_type"]), str(r["entity_id"])) == initial_key:
+                initial_index = idx
+
+        if self._entity_combo.count() > 0:
+            self._entity_combo.setCurrentIndex(initial_index)
+        self._on_entity_combo_changed()
+
+    def _current_entity(self) -> dict | None:
+        payload = self._entity_combo.currentData()
+        return payload if isinstance(payload, dict) else None
+
+    def _on_entity_combo_changed(self) -> None:
+        ent = self._current_entity()
+        if not ent:
+            self._entity_summary.setText("")
+            return
+        self._entity_summary.setText(
+            f"{str(ent['entity_type']).upper()} {ent['name']} ({ent['entity_id']}) — last seen {ent['last_seen_turn']}"
+        )
+        acct = ent.get("account_number")
+        if acct and (not self._account.text().strip()):
+            self._account.setText(str(acct))
 
 
 def run_app() -> None:
