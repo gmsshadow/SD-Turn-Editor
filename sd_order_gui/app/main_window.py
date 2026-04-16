@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QIntValidator
+from PySide6.QtGui import QFont, QFontDatabase, QIntValidator
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -41,6 +41,10 @@ from sd_order_gui.core.paths import get_paths
 from sd_order_gui.core.settings import load_settings
 from sd_order_gui.core.turn_ingest import ingest_turn_files
 from sd_order_gui.integrations.stellar_dominion.order_catalog import load_catalog_from_sd_repo
+from sd_order_gui.integrations.stellar_dominion.db_access import (
+    connect_sd,
+    resolve_sd_db_paths,
+)
 
 
 class MainWindow(QMainWindow):
@@ -60,6 +64,7 @@ class MainWindow(QMainWindow):
         self._report = QTextEdit()
         self._report.setReadOnly(True)
         self._report.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        self._report.setFont(_fixed_width_font(point_size=10))
 
         splitter = QSplitter()
         splitter.addWidget(self._list)
@@ -245,6 +250,19 @@ class AddOrderDialog(QDialog):
         catalog, _ = load_catalog_from_sd_repo(Path(settings.sd_repo_path))
         self._catalog = catalog
 
+        self._sd_conn = None
+        try:
+            sd_repo = Path(settings.sd_repo_path)
+            paths = resolve_sd_db_paths(
+                sd_repo_root=sd_repo,
+                state_db_path=getattr(settings, "sd_state_db_path", ""),
+                universe_db_path=getattr(settings, "sd_universe_db_path", ""),
+            )
+            if paths.state_db.exists():
+                self._sd_conn = connect_sd(paths=paths)
+        except Exception:
+            self._sd_conn = None
+
         self._command = QComboBox()
         allowed = self._allowed_commands_for_subject(subject_type)
         for spec in allowed:
@@ -270,6 +288,15 @@ class AddOrderDialog(QDialog):
         layout.addLayout(form)
         layout.addWidget(buttons)
         self.setLayout(layout)
+
+    def closeEvent(self, event):  # type: ignore[override]
+        if self._sd_conn is not None:
+            try:
+                self._sd_conn.close()
+            except Exception:
+                pass
+        self._sd_conn = None
+        super().closeEvent(event)
 
     def _allowed_commands_for_subject(self, subject_type: str):
         if subject_type in ("ship", "prefect"):
@@ -314,6 +341,69 @@ class AddOrderDialog(QDialog):
             form.addRow(label, le)
             return le
 
+        def db_combo(label: str, rows: list[tuple[int, str]], placeholder: str) -> tuple[QComboBox, QLineEdit]:
+            """
+            Returns (combo, manual_id_line). If manual id is set, it overrides combo.
+            """
+            cb = QComboBox()
+            cb.addItem(placeholder, None)
+            for _id, text in rows:
+                cb.addItem(text, int(_id))
+            manual = QLineEdit()
+            manual.setValidator(QIntValidator(1, 2_000_000_000, manual))
+            manual.setPlaceholderText("or enter ID manually")
+            form.addRow(label, cb)
+            form.addRow("", manual)
+            return cb, manual
+
+        def pick_id(cb: QComboBox, manual: QLineEdit) -> int | None:
+            if manual.text().strip():
+                return int(manual.text())
+            data = cb.currentData()
+            return int(data) if data is not None else None
+
+        bases: list[tuple[int, str]] = []
+        bodies: list[tuple[int, str]] = []
+        systems: list[tuple[int, str]] = []
+        goods: list[tuple[int, str]] = []
+        if self._sd_conn is not None:
+            try:
+                bases = [
+                    (int(r["base_id"]), f"{r['name']} ({r['base_id']})")
+                    for r in self._sd_conn.execute(
+                        "SELECT base_id, name FROM starbases ORDER BY name"
+                    ).fetchall()
+                ]
+            except Exception:
+                bases = []
+            try:
+                bodies = [
+                    (int(r["body_id"]), f"{r['name']} ({r['body_id']})")
+                    for r in self._sd_conn.execute(
+                        "SELECT body_id, name FROM universe.celestial_bodies ORDER BY name"
+                    ).fetchall()
+                ]
+            except Exception:
+                bodies = []
+            try:
+                systems = [
+                    (int(r["system_id"]), f"{r['name']} ({r['system_id']})")
+                    for r in self._sd_conn.execute(
+                        "SELECT system_id, name FROM universe.star_systems ORDER BY name"
+                    ).fetchall()
+                ]
+            except Exception:
+                systems = []
+            try:
+                goods = [
+                    (int(r["item_id"]), f"{r['name']} ({r['item_id']})")
+                    for r in self._sd_conn.execute(
+                        "SELECT item_id, name FROM universe.trade_goods ORDER BY name"
+                    ).fetchall()
+                ]
+            except Exception:
+                goods = []
+
         if param_type == "none":
             form.addRow(QLabel("No parameters for this command."))
             return w, (lambda: None)
@@ -324,19 +414,94 @@ class AddOrderDialog(QDialog):
             form.addRow("Value", sb)
             return w, (lambda sb=sb: int(sb.value()))
 
+        if param_type == "optional_integer":
+            sb = QSpinBox()
+            sb.setRange(1, 1_000_000)
+            sb.setValue(1)
+            form.addRow("Duration (default 1)", sb)
+            hint = QLabel("Leave as 1 for the default active scan duration.")
+            hint.setWordWrap(True)
+            form.addRow("", hint)
+            return w, (lambda sb=sb: int(sb.value()))
+
+        if param_type == "doctrine_choice":
+            cb = QComboBox()
+            cb.addItem("aggressive")
+            cb.addItem("defensive")
+            cb.addItem("evasive")
+            form.addRow("Doctrine", cb)
+            return w, (lambda cb=cb: {"doctrine": str(cb.currentText())})
+
+        if param_type == "list_op":
+            op = QComboBox()
+            op.addItem("add")
+            op.addItem("remove")
+            op.addItem("clear")
+            entry_type = QComboBox()
+            entry_type.addItem("ship")
+            entry_type.addItem("base")
+            entry_type.addItem("faction")
+            entry_id = QLineEdit()
+            entry_id.setValidator(QIntValidator(1, 2_000_000_000, entry_id))
+            entry_id.setPlaceholderText("numeric id (required for add/remove)")
+            form.addRow("Operation", op)
+            form.addRow("Entry type", entry_type)
+            form.addRow("Entry ID", entry_id)
+
+            def reader():
+                op_val = str(op.currentText())
+                if op_val == "clear":
+                    return {"op": "clear", "type": None, "id": None}
+                if not entry_id.text().strip():
+                    return None
+                return {
+                    "op": op_val,
+                    "type": str(entry_type.currentText()),
+                    "id": int(entry_id.text()),
+                }
+
+            return w, reader
+
         if param_type == "coordinate":
             le = QLineEdit()
             le.setPlaceholderText("e.g. M13, H04, D08")
             form.addRow("Coordinate", le)
             return w, (lambda le=le: le.text().strip() or None)
 
-        if param_type in ("body_id", "base_id", "system_id"):
-            le = int_line("ID", "numeric id")
+        if param_type == "base_id":
+            if bases:
+                cb, manual = db_combo("Base", bases, "(select a base)")
+                return w, (lambda cb=cb, manual=manual: pick_id(cb, manual))
+            le = int_line("Base ID", "numeric id")
+            return w, (lambda le=le: int(le.text()) if le.text().strip() else None)
+
+        if param_type == "body_id":
+            if bodies:
+                cb, manual = db_combo("Body", bodies, "(select a body)")
+                return w, (lambda cb=cb, manual=manual: pick_id(cb, manual))
+            le = int_line("Body ID", "numeric id")
+            return w, (lambda le=le: int(le.text()) if le.text().strip() else None)
+
+        if param_type == "system_id":
+            if systems:
+                cb, manual = db_combo("System", systems, "(select a system)")
+                return w, (lambda cb=cb, manual=manual: pick_id(cb, manual))
+            le = int_line("System ID", "numeric id")
             return w, (lambda le=le: int(le.text()) if le.text().strip() else None)
 
         if param_type == "trade_order":
-            base = int_line("Base ID", "e.g. 45687590")
-            item = int_line("Item ID", "e.g. 100102")
+            if bases:
+                base_cb, base_manual = db_combo("Base", bases, "(select a base)")
+            else:
+                base_cb, base_manual = None, None
+                base_line = int_line("Base ID", "e.g. 45687590")
+
+            if goods:
+                item_cb, item_manual = db_combo("Trade good", goods, "(select an item)")
+            else:
+                item_cb, item_manual = None, None
+                item_line = int_line("Item ID", "e.g. 100102")
+
             qty = QSpinBox()
             qty.setRange(1, 1_000_000)
             install = QCheckBox("Install immediately (if applicable)")
@@ -344,11 +509,21 @@ class AddOrderDialog(QDialog):
             form.addRow("", install)
 
             def reader():
-                if not base.text().strip() or not item.text().strip():
+                if bases:
+                    base_id = pick_id(base_cb, base_manual)  # type: ignore[arg-type]
+                else:
+                    base_id = int(base_line.text()) if base_line.text().strip() else None
+
+                if goods:
+                    item_id = pick_id(item_cb, item_manual)  # type: ignore[arg-type]
+                else:
+                    item_id = int(item_line.text()) if item_line.text().strip() else None
+
+                if not base_id or not item_id:
                     return None
                 return {
-                    "base": int(base.text()),
-                    "item": int(item.text()),
+                    "base": int(base_id),
+                    "item": int(item_id),
                     "qty": int(qty.value()),
                     "install": bool(install.isChecked()),
                 }
@@ -356,7 +531,12 @@ class AddOrderDialog(QDialog):
             return w, reader
 
         if param_type == "land_order":
-            body = int_line("Body ID", "e.g. 247985")
+            if bodies:
+                body_cb, body_manual = db_combo("Body", bodies, "(select a body)")
+                body_line = None
+            else:
+                body_cb, body_manual = None, None
+                body_line = int_line("Body ID", "e.g. 247985")
             x = QSpinBox()
             y = QSpinBox()
             x.setRange(1, 31)
@@ -365,9 +545,13 @@ class AddOrderDialog(QDialog):
             form.addRow("Y", y)
 
             def reader():
-                if not body.text().strip():
+                if bodies:
+                    body_id = pick_id(body_cb, body_manual)  # type: ignore[arg-type]
+                else:
+                    body_id = int(body_line.text()) if body_line and body_line.text().strip() else None
+                if not body_id:
                     return None
-                return {"body": int(body.text()), "x": int(x.value()), "y": int(y.value())}
+                return {"body": int(body_id), "x": int(x.value()), "y": int(y.value())}
 
             return w, reader
 
@@ -646,4 +830,28 @@ def run_app() -> None:
     w = MainWindow()
     w.show()
     raise SystemExit(app.exec())
+
+
+def _fixed_width_font(*, point_size: int = 10) -> QFont:
+    """
+    Prefer the platform's default fixed font for proper ASCII alignment.
+    Fall back to common monospace faces.
+    """
+    font = QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont)
+    if font and font.fixedPitch():
+        font.setPointSize(point_size)
+        return font
+
+    for family in ("Consolas", "Cascadia Mono", "Courier New", "Liberation Mono", "Monospace"):
+        f = QFont(family)
+        if f.exactMatch():
+            f.setFixedPitch(True)
+            f.setPointSize(point_size)
+            return f
+
+    font = QFont()
+    font.setStyleHint(QFont.StyleHint.Monospace)
+    font.setFixedPitch(True)
+    font.setPointSize(point_size)
+    return font
 

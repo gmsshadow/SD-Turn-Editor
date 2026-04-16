@@ -17,6 +17,11 @@ def _yaml_order_item(command: str, parsed_params: Any) -> Any:
     if isinstance(parsed_params, dict) and set(parsed_params.keys()) == {"col", "row"}:
         return {command: f"{parsed_params['col']}{int(parsed_params['row']):02d}"}
 
+    # optional_integer params (e.g. SCANLOCATION) parse into {'duration': N}
+    # but the orders YAML expects either a bare form or an integer.
+    if isinstance(parsed_params, dict) and set(parsed_params.keys()) == {"duration"}:
+        return {command: int(parsed_params["duration"])}
+
     return {command: parsed_params}
 
 
