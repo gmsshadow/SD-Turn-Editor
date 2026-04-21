@@ -7,7 +7,11 @@ from pathlib import Path
 from typing import Iterable
 
 from sd_order_gui.core.db import init_db
-from sd_order_gui.core.map_extract import extract_map_artifacts, map_cache_path
+from sd_order_gui.core.map_extract import (
+    extract_map_artifacts,
+    map_cache_path,
+    map_latest_cache_path,
+)
 from sd_order_gui.core.turn_parse import parse_entities_from_report_text
 
 
@@ -117,11 +121,20 @@ def ingest_turn_files(
             cache_root = turns_root.parent / "Cache"
             extracted_at = now
             for art in extract_map_artifacts(text):
+                # Use 0 instead of NULL so uniqueness keys behave.
+                sys_id = int(art.system_id or 0)
+                body_id = int(art.body_id or 0)
+
                 stored_map_path = map_cache_path(
                     cache_root=cache_root, artifact=art, turn_number=str(turn_number)
                 )
                 stored_map_path.parent.mkdir(parents=True, exist_ok=True)
                 stored_map_path.write_text(art.text, encoding="utf-8")
+
+                # Maintain an always-latest copy per system/body.
+                latest_path = map_latest_cache_path(cache_root=cache_root, artifact=art)
+                latest_path.parent.mkdir(parents=True, exist_ok=True)
+                latest_path.write_text(art.text, encoding="utf-8")
 
                 conn.execute(
                     """
@@ -130,14 +143,53 @@ def ingest_turn_files(
                     """,
                     (
                         art.map_type,
-                        art.system_id,
-                        art.body_id,
+                        sys_id,
+                        body_id,
                         str(turn_number),
                         str(stored),
                         str(stored_map_path),
                         extracted_at,
                     ),
                 )
+
+                conn.execute(
+                    """
+                    INSERT INTO map_latest(map_type, system_id, body_id, turn_number, source_report_path, stored_path, extracted_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(map_type, system_id, body_id) DO UPDATE SET
+                      turn_number = excluded.turn_number,
+                      source_report_path = excluded.source_report_path,
+                      stored_path = excluded.stored_path,
+                      extracted_at = excluded.extracted_at
+                    """,
+                    (
+                        art.map_type,
+                        sys_id,
+                        body_id,
+                        str(turn_number),
+                        str(stored),
+                        str(latest_path),
+                        extracted_at,
+                    ),
+                )
+
+                # Prune older scan history for this key (keep only the most recent).
+                old_rows = conn.execute(
+                    """
+                    SELECT artifact_id, stored_path
+                    FROM map_artifacts
+                    WHERE map_type = ? AND system_id = ? AND body_id = ? AND turn_number != ?
+                    """,
+                    (art.map_type, sys_id, body_id, str(turn_number)),
+                ).fetchall()
+                for r in old_rows:
+                    try:
+                        p = Path(str(r["stored_path"]))
+                        if p.exists() and p.resolve() != latest_path.resolve():
+                            p.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    conn.execute("DELETE FROM map_artifacts WHERE artifact_id = ?", (r["artifact_id"],))
             conn.commit()
 
             results.append(

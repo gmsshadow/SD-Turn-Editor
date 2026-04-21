@@ -122,3 +122,11 @@ def map_cache_path(*, cache_root: Path, artifact: MapArtifact, turn_number: str)
     bid = artifact.body_id or 0
     return cache_root / "maps" / f"body_{bid}" / f"scansurface_{turn_number}.txt"
 
+
+def map_latest_cache_path(*, cache_root: Path, artifact: MapArtifact) -> Path:
+    if artifact.map_type == "scansystem":
+        sid = artifact.system_id or 0
+        return cache_root / "maps" / f"system_{sid}" / "scansystem_latest.txt"
+    bid = artifact.body_id or 0
+    return cache_root / "maps" / f"body_{bid}" / "scansurface_latest.txt"
+

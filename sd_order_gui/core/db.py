@@ -34,8 +34,8 @@ CREATE INDEX IF NOT EXISTS idx_entities_type_name
 CREATE TABLE IF NOT EXISTS map_artifacts (
   artifact_id INTEGER PRIMARY KEY AUTOINCREMENT,
   map_type TEXT NOT NULL,                 -- scansystem | scansurface
-  system_id INTEGER,                      -- for scansystem
-  body_id INTEGER,                        -- for scansurface (best-effort)
+  system_id INTEGER NOT NULL DEFAULT 0,   -- for scansystem (else 0)
+  body_id INTEGER NOT NULL DEFAULT 0,     -- for scansurface (else 0)
   turn_number TEXT NOT NULL,
   source_report_path TEXT NOT NULL,
   stored_path TEXT NOT NULL,
@@ -44,6 +44,42 @@ CREATE TABLE IF NOT EXISTS map_artifacts (
 
 CREATE INDEX IF NOT EXISTS idx_map_artifacts_lookup
   ON map_artifacts(map_type, system_id, body_id, turn_number);
+
+-- Latest map per (type, system_id, body_id). Use 0 for unused id so PK works.
+CREATE TABLE IF NOT EXISTS map_latest (
+  map_type TEXT NOT NULL,                 -- scansystem | scansurface
+  system_id INTEGER NOT NULL DEFAULT 0,
+  body_id INTEGER NOT NULL DEFAULT 0,
+  turn_number TEXT NOT NULL,
+  source_report_path TEXT NOT NULL,
+  stored_path TEXT NOT NULL,
+  extracted_at TEXT NOT NULL,
+  PRIMARY KEY (map_type, system_id, body_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_map_latest_type
+  ON map_latest(map_type);
+
+-- Migration helpers (safe to run repeatedly)
+UPDATE map_artifacts SET system_id = 0 WHERE system_id IS NULL;
+UPDATE map_artifacts SET body_id = 0 WHERE body_id IS NULL;
+
+-- Rebuild map_latest to eliminate NULL-key duplicates from older schema.
+CREATE TABLE IF NOT EXISTS map_latest_v2 (
+  map_type TEXT NOT NULL,
+  system_id INTEGER NOT NULL DEFAULT 0,
+  body_id INTEGER NOT NULL DEFAULT 0,
+  turn_number TEXT NOT NULL,
+  source_report_path TEXT NOT NULL,
+  stored_path TEXT NOT NULL,
+  extracted_at TEXT NOT NULL,
+  PRIMARY KEY (map_type, system_id, body_id)
+);
+INSERT OR REPLACE INTO map_latest_v2(map_type, system_id, body_id, turn_number, source_report_path, stored_path, extracted_at)
+SELECT map_type, COALESCE(system_id, 0), COALESCE(body_id, 0), turn_number, source_report_path, stored_path, extracted_at
+FROM map_latest;
+DROP TABLE IF EXISTS map_latest;
+ALTER TABLE map_latest_v2 RENAME TO map_latest;
 """
 
 

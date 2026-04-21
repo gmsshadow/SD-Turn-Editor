@@ -26,6 +26,8 @@ from PySide6.QtWidgets import (
     QTextEdit,
     QToolBar,
     QTabWidget,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
     QSplitter,
@@ -39,8 +41,9 @@ from sd_order_gui.core.orders_yaml import (
     write_orders_file,
 )
 from sd_order_gui.core.paths import get_paths
-from sd_order_gui.core.settings import load_settings
+from sd_order_gui.core.settings import AppSettings, load_settings, save_settings
 from sd_order_gui.core.turn_ingest import ingest_turn_files
+from sd_order_gui.core.universe_data import load_universe, StarSystem
 from sd_order_gui.integrations.stellar_dominion.order_catalog import load_catalog_from_sd_repo
 from sd_order_gui.integrations.stellar_dominion.db_access import (
     connect_sd,
@@ -68,21 +71,44 @@ class MainWindow(QMainWindow):
         self._report.setFont(_fixed_width_font(point_size=10))
 
         self._maps_list = QListWidget()
+        self._maps_show_all = QCheckBox("Show all known maps (latest per system/body)")
+        self._maps_show_all.setChecked(True)
         self._maps_view = QTextEdit()
         self._maps_view.setReadOnly(True)
         self._maps_view.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
         self._maps_view.setFont(_fixed_width_font(point_size=10))
         self._maps_list.currentRowChanged.connect(self._on_map_selected)  # type: ignore[arg-type]
+        self._maps_show_all.toggled.connect(self._on_maps_mode_changed)  # type: ignore[arg-type]
 
         maps_panel = QWidget()
         maps_layout = QHBoxLayout()
-        maps_layout.addWidget(self._maps_list, 1)
+        left = QVBoxLayout()
+        left.addWidget(self._maps_show_all)
+        left.addWidget(self._maps_list, 1)
+        left_w = QWidget()
+        left_w.setLayout(left)
+
+        maps_layout.addWidget(left_w, 1)
         maps_layout.addWidget(self._maps_view, 2)
         maps_panel.setLayout(maps_layout)
 
         self._right_tabs = QTabWidget()
         self._right_tabs.addTab(self._report, "Report")
         self._right_tabs.addTab(maps_panel, "Maps")
+
+        # Universe tab: nested systems -> bodies, plus jump links text.
+        self._universe_tree = QTreeWidget()
+        self._universe_tree.setHeaderLabels(["Universe"])
+        self._universe_links = QTextEdit()
+        self._universe_links.setReadOnly(True)
+        self._universe_links.setFont(_fixed_width_font(point_size=10))
+
+        uni_panel = QWidget()
+        uni_layout = QHBoxLayout()
+        uni_layout.addWidget(self._universe_tree, 2)
+        uni_layout.addWidget(self._universe_links, 3)
+        uni_panel.setLayout(uni_layout)
+        self._right_tabs.addTab(uni_panel, "Universe")
 
         splitter = QSplitter()
         splitter.addWidget(self._list)
@@ -106,9 +132,117 @@ class MainWindow(QMainWindow):
         compose_action = tb.addAction("Compose orders…")
         compose_action.triggered.connect(self.compose_orders)  # type: ignore[arg-type]
 
+        uni_action = tb.addAction("Load universe…")
+        uni_action.triggered.connect(self.load_universe_view)  # type: ignore[arg-type]
+
+        uni_select_action = tb.addAction("Select universe file…")
+        uni_select_action.triggered.connect(self.select_universe_file)  # type: ignore[arg-type]
+
+        uni_clear_action = tb.addAction("Clear universe override")
+        uni_clear_action.triggered.connect(self.clear_universe_override)  # type: ignore[arg-type]
+
         self._list.currentRowChanged.connect(self._on_entity_selected)  # type: ignore[arg-type]
 
         self.refresh_entities()
+        self.load_universe_view()
+
+    def select_universe_file(self) -> None:
+        path_str, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select universe override file (YAML/JSON)",
+            str(Path.home()),
+            "Universe files (*.yaml *.yml *.json);;All files (*.*)",
+        )
+        if not path_str:
+            return
+
+        # Persist to settings.json and reload.
+        self._settings = AppSettings(
+            sd_repo_path=self._settings.sd_repo_path,
+            sd_state_db_path=self._settings.sd_state_db_path,
+            sd_universe_db_path=self._settings.sd_universe_db_path,
+            universe_override_path=str(Path(path_str)),
+            output_dir=self._settings.output_dir,
+            game_id=self._settings.game_id,
+        )
+        save_settings(self._paths.settings_path, self._settings)
+        self.statusBar().showMessage(f"Universe override set: {path_str}", 10_000)
+        self.load_universe_view()
+
+    def clear_universe_override(self) -> None:
+        if not getattr(self._settings, "universe_override_path", ""):
+            return
+        self._settings = AppSettings(
+            sd_repo_path=self._settings.sd_repo_path,
+            sd_state_db_path=self._settings.sd_state_db_path,
+            sd_universe_db_path=self._settings.sd_universe_db_path,
+            universe_override_path="",
+            output_dir=self._settings.output_dir,
+            game_id=self._settings.game_id,
+        )
+        save_settings(self._paths.settings_path, self._settings)
+        self.statusBar().showMessage("Universe override cleared (using SD DB).", 10_000)
+        self.load_universe_view()
+
+    def load_universe_view(self) -> None:
+        # Load from override file if configured, else from SD DB.
+        self._universe_tree.clear()
+        self._universe_links.setPlainText("")
+        try:
+            u = load_universe(
+                sd_repo_root=Path(self._settings.sd_repo_path),
+                state_db_path=self._settings.sd_state_db_path,
+                universe_db_path=self._settings.sd_universe_db_path,
+                override_path=getattr(self._settings, "universe_override_path", ""),
+            )
+        except Exception as e:
+            self._universe_links.setPlainText(f"Failed to load universe data:\n{e}")
+            return
+
+        # Build system -> bodies nesting (use parent_body_id for nesting inside system).
+        sys_map = {s.system_id: s for s in u.systems}
+        bodies_by_system: dict[int, list] = {}
+        children_by_parent: dict[int, list] = {}
+        for b in u.bodies:
+            bodies_by_system.setdefault(b.system_id, []).append(b)
+            if b.parent_body_id is not None:
+                children_by_parent.setdefault(b.parent_body_id, []).append(b)
+
+        # Top-level: systems
+        for sys_id in sorted(sys_map.keys(), key=lambda sid: sys_map[sid].name.lower()):
+            s = sys_map[sys_id]
+            sys_item = QTreeWidgetItem([f"{s.name} ({s.system_id})"])
+            self._universe_tree.addTopLevelItem(sys_item)
+
+            # Roots: bodies in this system that have no parent
+            roots = [b for b in bodies_by_system.get(sys_id, []) if b.parent_body_id is None]
+            roots.sort(key=lambda b: b.name.lower())
+
+            def add_body(parent_item: QTreeWidgetItem, body) -> None:
+                label = f"{body.name} ({body.body_id}) — {body.body_type}"
+                bi = QTreeWidgetItem([label])
+                parent_item.addChild(bi)
+                kids = children_by_parent.get(body.body_id, [])
+                kids.sort(key=lambda b: b.name.lower())
+                for k in kids:
+                    add_body(bi, k)
+
+            for b in roots:
+                add_body(sys_item, b)
+            sys_item.setExpanded(False)
+
+        # Jump links adjacency listing
+        neighbors: dict[int, set[int]] = {}
+        for l in u.links:
+            neighbors.setdefault(l.system_a, set()).add(l.system_b)
+            neighbors.setdefault(l.system_b, set()).add(l.system_a)
+        lines = []
+        for sys_id in sorted(sys_map.keys(), key=lambda sid: sys_map[sid].name.lower()):
+            name = sys_map[sys_id].name
+            n = sorted(list(neighbors.get(sys_id, set())), key=lambda sid: sys_map.get(sid, type("x",(object,),{"name":str(sid)})()).name)
+            n_str = ", ".join(f"{sys_map.get(x, StarSystem(x, str(x))).name} ({x})" for x in n) if n else "(none)"
+            lines.append(f"{name} ({sys_id}) -> {n_str}")
+        self._universe_links.setPlainText("\n".join(lines))
 
     def refresh_entities(self) -> None:
         self._list.clear()
@@ -141,7 +275,7 @@ class MainWindow(QMainWindow):
         try:
             rows = conn.execute(
                 """
-                SELECT entity_type, entity_id, name, account_number, last_seen_turn
+                SELECT entity_type, entity_id, name, account_number, last_seen_turn, last_seen_report_path
                 FROM entities
                 ORDER BY entity_type, name
                 LIMIT 1 OFFSET ?
@@ -194,23 +328,32 @@ class MainWindow(QMainWindow):
             "\n"
         )
         self._report.setPlainText(header + text)
-        self._refresh_maps_for_report(report_path=report_path)
+        self._refresh_maps(report_path=report_path)
 
-    def _refresh_maps_for_report(self, *, report_path: Path) -> None:
+    def _refresh_maps(self, *, report_path: Path) -> None:
         self._maps_list.clear()
         self._maps_view.setPlainText("")
         conn = db.connect(self._paths.db_path)
         try:
             db.init_db(conn)
-            rows = conn.execute(
-                """
-                SELECT artifact_id, map_type, system_id, body_id, turn_number, stored_path
-                FROM map_artifacts
-                WHERE source_report_path = ?
-                ORDER BY map_type, artifact_id
-                """,
-                (str(report_path),),
-            ).fetchall()
+            if self._maps_show_all.isChecked():
+                rows = conn.execute(
+                    """
+                    SELECT map_type, system_id, body_id, turn_number, stored_path
+                    FROM map_latest
+                    ORDER BY map_type, COALESCE(system_id, 0), COALESCE(body_id, 0)
+                    """
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT artifact_id, map_type, system_id, body_id, turn_number, stored_path
+                    FROM map_artifacts
+                    WHERE source_report_path = ?
+                    ORDER BY map_type, artifact_id
+                    """,
+                    (str(report_path),),
+                ).fetchall()
         finally:
             conn.close()
 
@@ -225,6 +368,14 @@ class MainWindow(QMainWindow):
 
         if self._maps_list.count() > 0:
             self._maps_list.setCurrentRow(0)
+
+    def _on_maps_mode_changed(self) -> None:
+        ent = self._get_selected_entity()
+        if not ent:
+            return
+        report_path = Path(str(ent.get("last_seen_report_path", "")))
+        if report_path:
+            self._refresh_maps(report_path=report_path)
 
     def _on_map_selected(self) -> None:
         it = self._maps_list.currentItem()
