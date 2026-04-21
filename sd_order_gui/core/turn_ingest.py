@@ -117,6 +117,15 @@ def ingest_turn_files(
                     ),
                 )
 
+                # Keep per-entity report history.
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO entity_reports(entity_type, entity_id, turn_number, report_path, imported_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (e.entity_type, e.entity_id, str(turn_number), str(stored), now),
+                )
+
             # Extract and cache map artifacts (SCANSYSTEM / SCANSURFACE).
             cache_root = turns_root.parent / "Cache"
             extracted_at = now

@@ -65,10 +65,19 @@ class MainWindow(QMainWindow):
         self._list = QListWidget()
         self._list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
 
+        self._report_history = QComboBox()
+        self._report_history.currentIndexChanged.connect(self._on_report_history_changed)  # type: ignore[arg-type]
+
         self._report = QTextEdit()
         self._report.setReadOnly(True)
         self._report.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
         self._report.setFont(_fixed_width_font(point_size=10))
+
+        report_panel = QWidget()
+        report_layout = QVBoxLayout()
+        report_layout.addWidget(self._report_history)
+        report_layout.addWidget(self._report, 1)
+        report_panel.setLayout(report_layout)
 
         self._maps_list = QListWidget()
         self._maps_show_all = QCheckBox("Show all known maps (latest per system/body)")
@@ -93,7 +102,7 @@ class MainWindow(QMainWindow):
         maps_panel.setLayout(maps_layout)
 
         self._right_tabs = QTabWidget()
-        self._right_tabs.addTab(self._report, "Report")
+        self._right_tabs.addTab(report_panel, "Report")
         self._right_tabs.addTab(maps_panel, "Maps")
 
         # Universe tab: nested systems -> bodies, plus jump links text.
@@ -290,29 +299,51 @@ class MainWindow(QMainWindow):
         ent = self._get_selected_entity()
         if not ent:
             self._report.setPlainText("")
+            self._report_history.clear()
             self._maps_list.clear()
             self._maps_view.setPlainText("")
             return
 
-        # Load the most recently-seen report for this entity.
+        self._load_report_history(ent)
+
+    def _load_report_history(self, ent: dict) -> None:
+        self._report_history.clear()
         conn = db.connect(self._paths.db_path)
         try:
-            row = conn.execute(
+            db.init_db(conn)
+            rows = conn.execute(
                 """
-                SELECT last_seen_report_path, last_seen_turn, account_number
-                FROM entities
+                SELECT turn_number, report_path
+                FROM entity_reports
                 WHERE entity_type = ? AND entity_id = ?
+                ORDER BY turn_number DESC, report_path DESC
                 """,
                 (str(ent["entity_type"]), str(ent["entity_id"])),
-            ).fetchone()
+            ).fetchall()
         finally:
             conn.close()
 
-        if not row:
-            self._report.setPlainText("")
+        if not rows:
+            # Fallback to last_seen if we have it.
+            last_path = ent.get("last_seen_report_path")
+            last_turn = ent.get("last_seen_turn")
+            if last_path and last_turn:
+                self._report_history.addItem(f"{last_turn} (latest)", {"turn": last_turn, "path": last_path})
+            self._on_report_history_changed()
             return
 
-        report_path = Path(str(row["last_seen_report_path"]))
+        for r in rows:
+            label = f"{r['turn_number']} — {Path(str(r['report_path'])).name}"
+            self._report_history.addItem(label, {"turn": r["turn_number"], "path": r["report_path"]})
+        self._report_history.setCurrentIndex(0)
+        self._on_report_history_changed()
+
+    def _on_report_history_changed(self) -> None:
+        payload = self._report_history.currentData()
+        if not isinstance(payload, dict) or "path" not in payload:
+            self._report.setPlainText("")
+            return
+        report_path = Path(str(payload["path"]))
         if not report_path.exists():
             self._report.setPlainText(
                 f"Report not found on disk:\n{report_path}\n\n"
@@ -321,9 +352,10 @@ class MainWindow(QMainWindow):
             return
 
         text = report_path.read_text(encoding="utf-8", errors="replace")
+        ent = self._get_selected_entity() or {}
         header = (
-            f"{str(ent['entity_type']).upper()} {ent['name']} ({ent['entity_id']})\n"
-            f"Last seen turn: {row['last_seen_turn']}\n"
+            f"{str(ent.get('entity_type','')).upper()} {ent.get('name','')} ({ent.get('entity_id','')})\n"
+            f"Viewing turn: {payload.get('turn','')}\n"
             f"Report: {report_path}\n"
             "\n"
         )
