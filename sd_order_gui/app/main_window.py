@@ -357,6 +357,7 @@ class AddOrderDialog(QDialog):
             return int(data) if data is not None else None
 
         bases: list[tuple[int, str]] = []
+        all_installations: list[tuple[int, str]] = []
         bodies: list[tuple[int, str]] = []
         systems: list[tuple[int, str]] = []
         goods: list[tuple[int, str]] = []
@@ -370,6 +371,37 @@ class AddOrderDialog(QDialog):
                 ]
             except Exception:
                 bases = []
+
+            # For combat list targeting (entry_type='base'), include all base-like entities.
+            try:
+                starbases = [
+                    (int(r["base_id"]), f"Starbase {r['name']} ({r['base_id']})")
+                    for r in self._sd_conn.execute(
+                        "SELECT base_id, name FROM starbases ORDER BY name"
+                    ).fetchall()
+                ]
+            except Exception:
+                starbases = []
+            try:
+                ports = [
+                    (int(r["port_id"]), f"Port {r['name']} ({r['port_id']})")
+                    for r in self._sd_conn.execute(
+                        "SELECT port_id, name FROM surface_ports ORDER BY name"
+                    ).fetchall()
+                ]
+            except Exception:
+                ports = []
+            try:
+                outposts = [
+                    (int(r["outpost_id"]), f"Outpost {r['name']} ({r['outpost_id']})")
+                    for r in self._sd_conn.execute(
+                        "SELECT outpost_id, name FROM outposts ORDER BY name"
+                    ).fetchall()
+                ]
+            except Exception:
+                outposts = []
+
+            all_installations = sorted(starbases + ports + outposts, key=lambda x: x[1].lower())
             try:
                 bodies = [
                     (int(r["body_id"]), f"{r['name']} ({r['body_id']})")
@@ -440,18 +472,44 @@ class AddOrderDialog(QDialog):
             entry_id.setPlaceholderText("numeric id (required for add/remove)")
             form.addRow("Operation", op)
             form.addRow("Entry type", entry_type)
+
+            # Optional: DB-backed picker for base targets (starbases, ports, outposts).
+            base_picker = QComboBox()
+            base_picker.addItem("(select a base/port/outpost)", None)
+            if all_installations:
+                for _id, label in all_installations:
+                    base_picker.addItem(label, int(_id))
+            base_picker.setEnabled(False)
+
+            def on_entry_type_changed():
+                is_base = str(entry_type.currentText()) == "base"
+                base_picker.setEnabled(is_base and bool(all_installations))
+                entry_id.setEnabled(not (is_base and bool(all_installations)))
+
+            entry_type.currentIndexChanged.connect(on_entry_type_changed)  # type: ignore[arg-type]
+
             form.addRow("Entry ID", entry_id)
+            if all_installations:
+                form.addRow("Pick base (optional)", base_picker)
+            on_entry_type_changed()
 
             def reader():
                 op_val = str(op.currentText())
                 if op_val == "clear":
                     return {"op": "clear", "type": None, "id": None}
-                if not entry_id.text().strip():
-                    return None
+                et = str(entry_type.currentText())
+                chosen_id: int | None = None
+                if et == "base" and all_installations:
+                    data = base_picker.currentData()
+                    chosen_id = int(data) if data is not None else None
+                if chosen_id is None:
+                    if not entry_id.text().strip():
+                        return None
+                    chosen_id = int(entry_id.text())
                 return {
                     "op": op_val,
-                    "type": str(entry_type.currentText()),
-                    "id": int(entry_id.text()),
+                    "type": et,
+                    "id": int(chosen_id),
                 }
 
             return w, reader
