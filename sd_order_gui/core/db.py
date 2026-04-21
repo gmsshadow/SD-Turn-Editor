@@ -30,6 +30,20 @@ CREATE TABLE IF NOT EXISTS entities (
 
 CREATE INDEX IF NOT EXISTS idx_entities_type_name
   ON entities(entity_type, name);
+
+CREATE TABLE IF NOT EXISTS map_artifacts (
+  artifact_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  map_type TEXT NOT NULL,                 -- scansystem | scansurface
+  system_id INTEGER,                      -- for scansystem
+  body_id INTEGER,                        -- for scansurface (best-effort)
+  turn_number TEXT NOT NULL,
+  source_report_path TEXT NOT NULL,
+  stored_path TEXT NOT NULL,
+  extracted_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_map_artifacts_lookup
+  ON map_artifacts(map_type, system_id, body_id, turn_number);
 """
 
 

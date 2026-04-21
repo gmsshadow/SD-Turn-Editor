@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QStatusBar,
     QTextEdit,
     QToolBar,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
     QSplitter,
@@ -66,9 +67,26 @@ class MainWindow(QMainWindow):
         self._report.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
         self._report.setFont(_fixed_width_font(point_size=10))
 
+        self._maps_list = QListWidget()
+        self._maps_view = QTextEdit()
+        self._maps_view.setReadOnly(True)
+        self._maps_view.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        self._maps_view.setFont(_fixed_width_font(point_size=10))
+        self._maps_list.currentRowChanged.connect(self._on_map_selected)  # type: ignore[arg-type]
+
+        maps_panel = QWidget()
+        maps_layout = QHBoxLayout()
+        maps_layout.addWidget(self._maps_list, 1)
+        maps_layout.addWidget(self._maps_view, 2)
+        maps_panel.setLayout(maps_layout)
+
+        self._right_tabs = QTabWidget()
+        self._right_tabs.addTab(self._report, "Report")
+        self._right_tabs.addTab(maps_panel, "Maps")
+
         splitter = QSplitter()
         splitter.addWidget(self._list)
-        splitter.addWidget(self._report)
+        splitter.addWidget(self._right_tabs)
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 2)
         self.setCentralWidget(splitter)
@@ -138,6 +156,8 @@ class MainWindow(QMainWindow):
         ent = self._get_selected_entity()
         if not ent:
             self._report.setPlainText("")
+            self._maps_list.clear()
+            self._maps_view.setPlainText("")
             return
 
         # Load the most recently-seen report for this entity.
@@ -174,6 +194,52 @@ class MainWindow(QMainWindow):
             "\n"
         )
         self._report.setPlainText(header + text)
+        self._refresh_maps_for_report(report_path=report_path)
+
+    def _refresh_maps_for_report(self, *, report_path: Path) -> None:
+        self._maps_list.clear()
+        self._maps_view.setPlainText("")
+        conn = db.connect(self._paths.db_path)
+        try:
+            db.init_db(conn)
+            rows = conn.execute(
+                """
+                SELECT artifact_id, map_type, system_id, body_id, turn_number, stored_path
+                FROM map_artifacts
+                WHERE source_report_path = ?
+                ORDER BY map_type, artifact_id
+                """,
+                (str(report_path),),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        for r in rows:
+            if r["map_type"] == "scansystem":
+                label = f"SCANSYSTEM — system {r['system_id']} — turn {r['turn_number']}"
+            else:
+                label = f"SCANSURFACE — body {r['body_id'] or '?'} — turn {r['turn_number']}"
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, {"stored_path": r["stored_path"]})
+            self._maps_list.addItem(item)
+
+        if self._maps_list.count() > 0:
+            self._maps_list.setCurrentRow(0)
+
+    def _on_map_selected(self) -> None:
+        it = self._maps_list.currentItem()
+        if not it:
+            self._maps_view.setPlainText("")
+            return
+        payload = it.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(payload, dict) or "stored_path" not in payload:
+            self._maps_view.setPlainText("")
+            return
+        path = Path(str(payload["stored_path"]))
+        if not path.exists():
+            self._maps_view.setPlainText(f"Map file not found:\n{path}")
+            return
+        self._maps_view.setPlainText(path.read_text(encoding="utf-8", errors="replace"))
 
     def import_turns(self) -> None:
         files, _ = QFileDialog.getOpenFileNames(

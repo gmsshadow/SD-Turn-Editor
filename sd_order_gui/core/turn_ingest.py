@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Iterable
 
 from sd_order_gui.core.db import init_db
+from sd_order_gui.core.map_extract import extract_map_artifacts, map_cache_path
 from sd_order_gui.core.turn_parse import parse_entities_from_report_text
 
 
@@ -109,6 +110,32 @@ def ingest_turn_files(
                         e.account_number,
                         str(turn_number),
                         str(stored),
+                    ),
+                )
+
+            # Extract and cache map artifacts (SCANSYSTEM / SCANSURFACE).
+            cache_root = turns_root.parent / "Cache"
+            extracted_at = now
+            for art in extract_map_artifacts(text):
+                stored_map_path = map_cache_path(
+                    cache_root=cache_root, artifact=art, turn_number=str(turn_number)
+                )
+                stored_map_path.parent.mkdir(parents=True, exist_ok=True)
+                stored_map_path.write_text(art.text, encoding="utf-8")
+
+                conn.execute(
+                    """
+                    INSERT INTO map_artifacts(map_type, system_id, body_id, turn_number, source_report_path, stored_path, extracted_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        art.map_type,
+                        art.system_id,
+                        art.body_id,
+                        str(turn_number),
+                        str(stored),
+                        str(stored_map_path),
+                        extracted_at,
                     ),
                 )
             conn.commit()
