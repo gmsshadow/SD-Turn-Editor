@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont, QFontDatabase, QIntValidator
@@ -31,9 +32,12 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
     QSplitter,
+    QStackedWidget,
 )
 
 from sd_order_gui.core import db
+from sd_order_gui.core.ascii_surface_map import parse_scansurface_ascii
+from sd_order_gui.core.ascii_system_map import parse_scansystem_ascii
 from sd_order_gui.core.orders_model import DraftOrder, DraftOrderFile
 from sd_order_gui.core.orders_yaml import (
     build_orders_yaml,
@@ -49,6 +53,7 @@ from sd_order_gui.integrations.stellar_dominion.db_access import (
     connect_sd,
     resolve_sd_db_paths,
 )
+from sd_order_gui.app.map_tile_view import MapTileView
 
 
 class MainWindow(QMainWindow):
@@ -61,6 +66,7 @@ class MainWindow(QMainWindow):
         self._paths.data_dir.mkdir(parents=True, exist_ok=True)
         self._paths.turns_dir.mkdir(parents=True, exist_ok=True)
         self._settings = load_settings(self._paths.settings_path)
+        self._system_name_by_id: dict[int, str] = {}
 
         self._list = QListWidget()
         self._list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
@@ -82,23 +88,32 @@ class MainWindow(QMainWindow):
         self._maps_list = QListWidget()
         self._maps_show_all = QCheckBox("Show all known maps (latest per system/body)")
         self._maps_show_all.setChecked(True)
+        self._maps_tile_mode = QCheckBox("Tile view")
+        self._maps_tile_mode.setChecked(True)
         self._maps_view = QTextEdit()
         self._maps_view.setReadOnly(True)
         self._maps_view.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
         self._maps_view.setFont(_fixed_width_font(point_size=10))
+        tiles_dir = Path(__file__).resolve().parents[1] / "assets" / "tiles"
+        self._maps_tiles = MapTileView(tiles_dir=tiles_dir)
+        self._maps_stack = QStackedWidget()
+        self._maps_stack.addWidget(self._maps_tiles)
+        self._maps_stack.addWidget(self._maps_view)
         self._maps_list.currentRowChanged.connect(self._on_map_selected)  # type: ignore[arg-type]
         self._maps_show_all.toggled.connect(self._on_maps_mode_changed)  # type: ignore[arg-type]
+        self._maps_tile_mode.toggled.connect(self._on_maps_view_mode_changed)  # type: ignore[arg-type]
 
         maps_panel = QWidget()
         maps_layout = QHBoxLayout()
         left = QVBoxLayout()
         left.addWidget(self._maps_show_all)
+        left.addWidget(self._maps_tile_mode)
         left.addWidget(self._maps_list, 1)
         left_w = QWidget()
         left_w.setLayout(left)
 
         maps_layout.addWidget(left_w, 1)
-        maps_layout.addWidget(self._maps_view, 2)
+        maps_layout.addWidget(self._maps_stack, 2)
         maps_panel.setLayout(maps_layout)
 
         self._right_tabs = QTabWidget()
@@ -197,6 +212,7 @@ class MainWindow(QMainWindow):
         # Load from override file if configured, else from SD DB.
         self._universe_tree.clear()
         self._universe_links.setPlainText("")
+        self._system_name_by_id = {}
         try:
             u = load_universe(
                 sd_repo_root=Path(self._settings.sd_repo_path),
@@ -210,6 +226,7 @@ class MainWindow(QMainWindow):
 
         # Build system -> bodies nesting (use parent_body_id for nesting inside system).
         sys_map = {s.system_id: s for s in u.systems}
+        self._system_name_by_id = {int(s.system_id): str(s.name) for s in u.systems}
         bodies_by_system: dict[int, list] = {}
         children_by_parent: dict[int, list] = {}
         for b in u.bodies:
@@ -389,11 +406,33 @@ class MainWindow(QMainWindow):
         finally:
             conn.close()
 
+        surface_title_re = re.compile(r"^\s*Surface Map:\s+(?P<name>.+?)\s+\((?P<id>\d+)\)")
+
         for r in rows:
             if r["map_type"] == "scansystem":
-                label = f"SCANSYSTEM — system {r['system_id']} — turn {r['turn_number']}"
+                sid = int(r["system_id"] or 0)
+                sname = self._system_name_by_id.get(sid)
+                if sname:
+                    label = f"System Map: {sname} ({sid})"
+                else:
+                    label = f"SCANSYSTEM — system {sid} — turn {r['turn_number']}"
             else:
                 label = f"SCANSURFACE — body {r['body_id'] or '?'} — turn {r['turn_number']}"
+                try:
+                    p = Path(str(r["stored_path"]))
+                    if p.exists():
+                        # Cached blocks include the '>OC ...: SCANSURFACE' line; scan the header area.
+                        head = p.read_text(encoding="utf-8", errors="replace").splitlines()[:40]
+                        for ln in head:
+                            m = surface_title_re.match(ln)
+                            if m:
+                                name = m.group("name").strip()
+                                bid = m.group("id").strip()
+                                label = f"Surface Map: {name} ({bid})"
+                                break
+                except Exception:
+                    # Best-effort only; fall back to id-based label.
+                    pass
             item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, {"stored_path": r["stored_path"]})
             self._maps_list.addItem(item)
@@ -409,20 +448,39 @@ class MainWindow(QMainWindow):
         if report_path:
             self._refresh_maps(report_path=report_path)
 
+    def _on_maps_view_mode_changed(self) -> None:
+        # 0 = tiles, 1 = text
+        self._maps_stack.setCurrentIndex(0 if self._maps_tile_mode.isChecked() else 1)
+
     def _on_map_selected(self) -> None:
         it = self._maps_list.currentItem()
         if not it:
             self._maps_view.setPlainText("")
+            self._maps_tiles.clear_map()
             return
         payload = it.data(Qt.ItemDataRole.UserRole)
         if not isinstance(payload, dict) or "stored_path" not in payload:
             self._maps_view.setPlainText("")
+            self._maps_tiles.clear_map()
             return
         path = Path(str(payload["stored_path"]))
         if not path.exists():
             self._maps_view.setPlainText(f"Map file not found:\n{path}")
+            self._maps_tiles.clear_map()
             return
-        self._maps_view.setPlainText(path.read_text(encoding="utf-8", errors="replace"))
+        text = path.read_text(encoding="utf-8", errors="replace")
+        self._maps_view.setPlainText(text)
+        parsed = parse_scansurface_ascii(text)
+        if parsed:
+            self._maps_tiles.set_surface_map(parsed)
+            return
+
+        sys_parsed = parse_scansystem_ascii(text)
+        if sys_parsed:
+            self._maps_tiles.set_system_map(sys_parsed)
+            return
+
+        self._maps_tiles.clear_map()
 
     def import_turns(self) -> None:
         files, _ = QFileDialog.getOpenFileNames(
