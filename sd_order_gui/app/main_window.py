@@ -67,6 +67,7 @@ class MainWindow(QMainWindow):
         self._paths.turns_dir.mkdir(parents=True, exist_ok=True)
         self._settings = load_settings(self._paths.settings_path)
         self._system_name_by_id: dict[int, str] = {}
+        self._system_map_details_cache: dict[int, dict[tuple[int, int], str]] = {}
 
         self._list = QListWidget()
         self._list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
@@ -213,6 +214,7 @@ class MainWindow(QMainWindow):
         self._universe_tree.clear()
         self._universe_links.setPlainText("")
         self._system_name_by_id = {}
+        self._system_map_details_cache = {}
         try:
             u = load_universe(
                 sd_repo_root=Path(self._settings.sd_repo_path),
@@ -434,11 +436,86 @@ class MainWindow(QMainWindow):
                     # Best-effort only; fall back to id-based label.
                     pass
             item = QListWidgetItem(label)
-            item.setData(Qt.ItemDataRole.UserRole, {"stored_path": r["stored_path"]})
+            item.setData(
+                Qt.ItemDataRole.UserRole,
+                {
+                    "stored_path": r["stored_path"],
+                    "map_type": r["map_type"],
+                    "system_id": int(r["system_id"] or 0),
+                    "body_id": int(r["body_id"] or 0),
+                },
+            )
             self._maps_list.addItem(item)
 
         if self._maps_list.count() > 0:
             self._maps_list.setCurrentRow(0)
+
+    def _system_map_details(self, system_id: int) -> dict[tuple[int, int], str]:
+        """
+        Best-effort lookup of object names/ids at grid coords for tooltips.
+        Uses the attached Stellar Dominion universe DB if configured.
+        """
+        if system_id in self._system_map_details_cache:
+            return self._system_map_details_cache[system_id]
+
+        out: dict[tuple[int, int], str] = {}
+        try:
+            sd_repo = Path(self._settings.sd_repo_path)
+            paths = resolve_sd_db_paths(
+                sd_repo_root=sd_repo,
+                state_db_path=getattr(self._settings, "sd_state_db_path", ""),
+                universe_db_path=getattr(self._settings, "sd_universe_db_path", ""),
+            )
+            if not paths.state_db.exists():
+                self._system_map_details_cache[system_id] = out
+                return out
+
+            conn = connect_sd(paths=paths)
+            try:
+                # Star (no id)
+                srow = conn.execute(
+                    "SELECT star_name, star_grid_col, star_grid_row FROM universe.star_systems WHERE system_id = ?",
+                    (int(system_id),),
+                ).fetchone()
+                if srow and srow["star_name"] and srow["star_grid_col"] and srow["star_grid_row"] is not None:
+                    col = str(srow["star_grid_col"]).strip().upper()
+                    row = int(srow["star_grid_row"])
+                    if col and 1 <= row <= 25:
+                        x = ord(col[0]) - ord("A") + 1
+                        if 1 <= x <= 25:
+                            out[(x, row)] = f"Star {str(srow['star_name']).strip()}"
+
+                # Bodies
+                brows = conn.execute(
+                    "SELECT body_id, name, body_type, grid_col, grid_row "
+                    "FROM universe.celestial_bodies WHERE system_id = ?",
+                    (int(system_id),),
+                ).fetchall()
+                for b in brows:
+                    try:
+                        col = str(b["grid_col"]).strip().upper()
+                        row = int(b["grid_row"])
+                        if not col or not (1 <= row <= 25):
+                            continue
+                        x = ord(col[0]) - ord("A") + 1
+                        if not (1 <= x <= 25):
+                            continue
+                        bt = str(b["body_type"]).replace("_", " ").strip().title()
+                        name = str(b["name"]).strip()
+                        bid = int(b["body_id"])
+                        out[(x, row)] = f"{bt} {name} ({bid})"
+                    except Exception:
+                        continue
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        except Exception:
+            out = {}
+
+        self._system_map_details_cache[system_id] = out
+        return out
 
     def _on_maps_mode_changed(self) -> None:
         ent = self._get_selected_entity()
@@ -477,7 +554,9 @@ class MainWindow(QMainWindow):
 
         sys_parsed = parse_scansystem_ascii(text)
         if sys_parsed:
-            self._maps_tiles.set_system_map(sys_parsed)
+            sid = int(payload.get("system_id") or 0)
+            details = self._system_map_details(sid) if sid else None
+            self._maps_tiles.set_system_map(sys_parsed, details_by_xy=details)
             return
 
         self._maps_tiles.clear_map()

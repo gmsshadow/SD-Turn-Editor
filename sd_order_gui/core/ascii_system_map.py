@@ -28,7 +28,6 @@ _SYMBOL_TO_OBJECT: dict[str, str] = {
     "S": "Stargate",
 }
 
-_HEADER_RE = re.compile(r"^\s*A(\s+B){5,}.*\s+Y\s*$", re.IGNORECASE)
 _ROW_RE = re.compile(r"^\s*(?P<row>\d{2})\s+(?P<body>.+?)\s*$")
 
 
@@ -41,9 +40,13 @@ def parse_scansystem_ascii(text: str) -> ParsedSystemMap | None:
     """
     lines = text.splitlines()
 
+    # Header line is the column letters A..Y separated by spaces.
+    expected_cols = [chr(c) for c in range(ord("A"), ord("Y") + 1)]
+
     header_idx: int | None = None
     for i, ln in enumerate(lines):
-        if _HEADER_RE.match(ln):
+        tokens = [t for t in ln.strip().split() if t]
+        if tokens == expected_cols:
             header_idx = i
             break
     if header_idx is None:

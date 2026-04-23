@@ -187,8 +187,11 @@ class MapTileView(QGraphicsView):
             self._scene.addItem(it)
 
         self._scene.setSceneRect(QRectF(0, 0, size * tile_px, size * tile_px))
+        # Ensure the newly-rendered map is visible even after previous pan/zoom.
+        self.resetTransform()
+        self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
 
-    def set_system_map(self, parsed: ParsedSystemMap) -> None:
+    def set_system_map(self, parsed: ParsedSystemMap, *, details_by_xy: dict[tuple[int, int], str] | None = None) -> None:
         self._scene.clear()
 
         tile_px = int(self._cfg.tile_px)
@@ -211,12 +214,16 @@ class MapTileView(QGraphicsView):
             col_letter = chr(ord("A") + (col - 1))
             coord = f"{col_letter}{row:02d}"
             it = _TileItem(pm, x=col, y=row, terrain=obj)
-            it.setToolTip(f"{coord} — {obj}")
+            detail = details_by_xy.get((col, row)) if details_by_xy else None
+            it.setToolTip(f"{coord} — {detail or obj}")
             # System maps are rendered top-down: row 01 at top.
             it.setPos((col - 1) * tile_px, (row - 1) * tile_px)
             self._scene.addItem(it)
 
         self._scene.setSceneRect(QRectF(0, 0, w * tile_px, h * tile_px))
+        # Ensure the newly-rendered map is visible even after previous pan/zoom.
+        self.resetTransform()
+        self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
 
     def wheelEvent(self, event) -> None:  # type: ignore[override]
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
