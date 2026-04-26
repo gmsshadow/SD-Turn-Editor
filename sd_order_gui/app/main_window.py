@@ -942,9 +942,21 @@ class AddOrderDialog(QDialog):
 
             qty = QSpinBox()
             qty.setRange(1, 1_000_000)
-            install = QCheckBox("Install immediately (if applicable)")
+            install = QCheckBox("Install immediately (components only)")
+            magazine = QCheckBox("Load into magazine (ammo only)")
             form.addRow("Quantity", qty)
             form.addRow("", install)
+            form.addRow("", magazine)
+
+            def _sync_flags() -> None:
+                # Game disallows both flags at once.
+                if install.isChecked():
+                    magazine.setChecked(False)
+                elif magazine.isChecked():
+                    install.setChecked(False)
+
+            install.toggled.connect(_sync_flags)  # type: ignore[arg-type]
+            magazine.toggled.connect(_sync_flags)  # type: ignore[arg-type]
 
             def reader():
                 if bases:
@@ -964,6 +976,7 @@ class AddOrderDialog(QDialog):
                     "item": int(item_id),
                     "qty": int(qty.value()),
                     "install": bool(install.isChecked()),
+                    "magazine": bool(magazine.isChecked()),
                 }
 
             return w, reader
@@ -1111,6 +1124,68 @@ class AddOrderDialog(QDialog):
             text.setPlaceholderText("request text")
             form.addRow("Text", text)
             return w, (lambda: text.text().strip() or None)
+
+        if param_type == "magazine_op":
+            ammo = QComboBox()
+            ammo.addItem("missile")
+            ammo.addItem("torpedo")
+            qty = QSpinBox()
+            qty.setRange(1, 1_000_000)
+            form.addRow("Ammo", ammo)
+            form.addRow("Quantity", qty)
+
+            return w, (lambda: {"ammo": str(ammo.currentText()), "qty": int(qty.value())})
+
+        if param_type == "share_order":
+            # SHARE <type> <id> [FACTION | PREFECT <id>]
+            obj_type = QComboBox()
+            # Common, human-facing names; parser normalises many aliases.
+            obj_type.addItem("system")
+            obj_type.addItem("body")
+            obj_type.addItem("starbase")
+            obj_type.addItem("port")
+            obj_type.addItem("outpost")
+
+            obj_id = QLineEdit()
+            obj_id.setValidator(QIntValidator(1, 2_000_000_000, obj_id))
+            obj_id.setPlaceholderText("numeric id")
+
+            target = QComboBox()
+            target.addItem("faction")
+            target.addItem("prefect")
+
+            target_prefect_id = QLineEdit()
+            target_prefect_id.setValidator(QIntValidator(1, 2_000_000_000, target_prefect_id))
+            target_prefect_id.setPlaceholderText("prefect id (required if target=prefect)")
+
+            def _sync_target() -> None:
+                is_prefect = str(target.currentText()) == "prefect"
+                target_prefect_id.setEnabled(is_prefect)
+
+            target.currentIndexChanged.connect(_sync_target)  # type: ignore[arg-type]
+            _sync_target()
+
+            form.addRow("Object type", obj_type)
+            form.addRow("Object ID", obj_id)
+            form.addRow("Share to", target)
+            form.addRow("Target prefect", target_prefect_id)
+
+            def reader():
+                if not obj_id.text().strip():
+                    return None
+                tgt = str(target.currentText())
+                payload = {
+                    "type": str(obj_type.currentText()),
+                    "id": int(obj_id.text()),
+                    "target": tgt,
+                }
+                if tgt == "prefect":
+                    if not target_prefect_id.text().strip():
+                        return None
+                    payload["prefect_id"] = int(target_prefect_id.text())
+                return payload
+
+            return w, reader
 
         # Unknown param type: allow raw text entry (still validated on save).
         le = QLineEdit()
